@@ -1,35 +1,54 @@
 /**
  * fileTransfer.js
  *
- * CLI tool to export images from one Shopify store and import them to another.
+ * Transfers image files from one Shopify store to another.
+ * Requires permanent access tokens in .env (use shopify-token-generator to get them).
  *
  * Usage:
- *   node fileTransfer.js export              → fetch all images from source → export.json
- *   node fileTransfer.js import              → upload images from export.json → dest store
- *   node fileTransfer.js transfer            → export then import in one step
- *   node fileTransfer.js refresh-tokens      → force re-fetch both tokens
- *   node fileTransfer.js clear-tokens        → wipe tokens.cache.json
+ *   node fileTransfer.js export      Fetch all images from source store → export.json
+ *   node fileTransfer.js import      Upload images from export.json → dest store
+ *   node fileTransfer.js transfer    Do both in one step
  */
 
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as dotenv from "dotenv";
-import { getToken, refreshToken, clearTokenCache } from "./auth.js";
 
 dotenv.config();
 
-const __dirname  = path.dirname(fileURLToPath(import.meta.url));
+const __dirname   = path.dirname(fileURLToPath(import.meta.url));
 const EXPORT_FILE = path.join(__dirname, "export.json");
 const API_VERSION = "2024-10";
 
-// ─── Logging ─────────────────────────────────────────────────────────────────
+const FROM_STORE = process.env.FROM_STORE_URL;
+const FROM_TOKEN = process.env.FROM_ACCESS_TOKEN;
+const TO_STORE   = process.env.TO_STORE_URL;
+const TO_TOKEN   = process.env.TO_ACCESS_TOKEN;
+
+// ─── Logging ──────────────────────────────────────────────────────────────────
 const log     = (msg) => console.log(`  ${msg}`);
 const ok      = (msg) => console.log(`✅ ${msg}`);
 const warn    = (msg) => console.warn(`⚠️  ${msg}`);
 const fail    = (msg) => { console.error(`❌ ${msg}`); process.exit(1); };
 const divider = (msg) => console.log(`\n${"─".repeat(55)}\n  ${msg}\n${"─".repeat(55)}`);
 const sleep   = (ms)  => new Promise((r) => setTimeout(r, ms));
+
+// ─── Validate env ─────────────────────────────────────────────────────────────
+function validateEnv(mode) {
+  const missing = [];
+  if (mode === "export" || mode === "transfer") {
+    if (!FROM_STORE) missing.push("FROM_STORE_URL");
+    if (!FROM_TOKEN) missing.push("FROM_ACCESS_TOKEN");
+  }
+  if (mode === "import" || mode === "transfer") {
+    if (!TO_STORE) missing.push("TO_STORE_URL");
+    if (!TO_TOKEN) missing.push("TO_ACCESS_TOKEN");
+  }
+  if (missing.length) {
+    fail(`Missing required .env values:\n\n  ${missing.join("\n  ")}\n\n  See .env.example — use shopify-token-generator to get tokens.`);
+  }
+}
 
 // ─── GraphQL client ───────────────────────────────────────────────────────────
 async function gql(store, token, query, variables = {}) {
@@ -51,6 +70,7 @@ async function gql(store, token, query, variables = {}) {
   }
 
   const json = await res.json();
+
   if (json.errors?.length) {
     throw new Error(`GraphQL error: ${JSON.stringify(json.errors, null, 2)}`);
   }
@@ -89,11 +109,8 @@ const EXPORT_QUERY = `
 
 async function runExport() {
   divider("EXPORT — Fetching images from source store");
-
-  const store = process.env.FROM_STORE_URL;
-  const token = await getToken("from");
-
-  log(`Store: ${store}`);
+  validateEnv("export");
+  log(`Store: ${FROM_STORE}`);
 
   const allFiles = [];
   let cursor = null;
@@ -102,14 +119,12 @@ async function runExport() {
   while (true) {
     log(`Fetching page ${page}...`);
 
-    const data  = await gql(store, token, EXPORT_QUERY, { cursor });
+    const data  = await gql(FROM_STORE, FROM_TOKEN, EXPORT_QUERY, { cursor });
     const edges = data.files.edges;
 
     for (const edge of edges) {
       const node = edge.node;
-      // Skip anything that didn't resolve as a MediaImage
       if (!node?.image) continue;
-
       allFiles.push({
         id:        node.id,
         alt:       node.alt ?? "",
@@ -124,7 +139,6 @@ async function runExport() {
     if (!data.files.pageInfo.hasNextPage) break;
     cursor = data.files.pageInfo.endCursor;
     page++;
-
     await sleep(300);
   }
 
@@ -162,17 +176,17 @@ const FILE_CREATE_MUTATION = `
   }
 `;
 
-async function uploadSingleFile(store, token, file) {
+async function uploadSingleFile(file) {
   const filename = file.url.split("/").pop().split("?")[0] || "image.jpg";
   const mimeType = file.mimeType ?? "image/jpeg";
 
-  // Step 1 — request a staged upload slot from Shopify
-  const stagedData = await gql(store, token, STAGED_UPLOAD_MUTATION, {
+  // Step 1 — request a staged upload target
+  const stagedData = await gql(TO_STORE, TO_TOKEN, STAGED_UPLOAD_MUTATION, {
     input: [{
       filename,
       mimeType,
       httpMethod: "POST",
-      resource: "IMAGE",
+      resource:   "IMAGE",
     }],
   });
 
@@ -183,14 +197,14 @@ async function uploadSingleFile(store, token, file) {
 
   const target = stagedTargets[0];
 
-  // Step 2 — fetch the raw image bytes from the source URL
+  // Step 2 — fetch raw image bytes from source URL
   const imageRes = await fetch(file.url);
   if (!imageRes.ok) {
     throw new Error(`Failed to fetch source image (HTTP ${imageRes.status}): ${file.url}`);
   }
   const imageBuffer = await imageRes.arrayBuffer();
 
-  // Step 3 — POST the image bytes to the staged upload target
+  // Step 3 — POST image to staged upload target
   const formData = new FormData();
   for (const param of target.parameters) {
     formData.append(param.name, param.value);
@@ -203,8 +217,8 @@ async function uploadSingleFile(store, token, file) {
     throw new Error(`Staged upload POST failed (HTTP ${uploadRes.status}): ${text}`);
   }
 
-  // Step 4 — register the file in Shopify using the resourceUrl
-  const createData = await gql(store, token, FILE_CREATE_MUTATION, {
+  // Step 4 — register the file in Shopify
+  const createData = await gql(TO_STORE, TO_TOKEN, FILE_CREATE_MUTATION, {
     files: [{
       originalSource: target.resourceUrl,
       alt:            file.alt ?? "",
@@ -222,11 +236,8 @@ async function uploadSingleFile(store, token, file) {
 
 async function runImport(files = null) {
   divider("IMPORT — Uploading images to destination store");
+  validateEnv("import");
 
-  const store = process.env.TO_STORE_URL;
-  const token = await getToken("to");
-
-  // Load from export.json if not passed in directly (i.e. standalone import)
   if (!files) {
     if (!fs.existsSync(EXPORT_FILE)) {
       fail("export.json not found. Run `node fileTransfer.js export` first.");
@@ -234,7 +245,7 @@ async function runImport(files = null) {
     files = JSON.parse(fs.readFileSync(EXPORT_FILE, "utf-8"));
   }
 
-  log(`Store:          ${store}`);
+  log(`Store:           ${TO_STORE}`);
   log(`Files to import: ${files.length}`);
   console.log("");
 
@@ -247,7 +258,7 @@ async function runImport(files = null) {
 
     try {
       process.stdout.write(`  [${i + 1}/${files.length}] ${label} ... `);
-      await uploadSingleFile(store, token, file);
+      await uploadSingleFile(file);
       console.log("✅");
       successCount++;
     } catch (err) {
@@ -256,7 +267,6 @@ async function runImport(files = null) {
       failCount++;
     }
 
-    // Respect Shopify's rate limits
     await sleep(500);
   }
 
@@ -264,7 +274,7 @@ async function runImport(files = null) {
   ok(`Import complete — ${successCount} succeeded, ${failCount} failed`);
 }
 
-// ─── TRANSFER (export + import in one go) ─────────────────────────────────────
+// ─── Transfer (export + import) ───────────────────────────────────────────────
 async function runTransfer() {
   const files = await runExport();
   await runImport(files);
@@ -286,34 +296,19 @@ switch (command) {
     runTransfer().catch((e) => fail(e.message));
     break;
 
-  case "refresh-tokens":
-    refreshToken("both")
-      .then(() => ok("Both tokens refreshed."))
-      .catch((e) => fail(e.message));
-    break;
-
-  case "clear-tokens":
-    clearTokenCache();
-    break;
-
   default:
     console.log(`
 Shopify File Transfer — Image Migrator
 
 Usage:
-  node fileTransfer.js export           Fetch all images from source → export.json
-  node fileTransfer.js import           Upload images from export.json → dest store
-  node fileTransfer.js transfer         Do both in one step
-  node fileTransfer.js refresh-tokens   Force re-fetch both access tokens
-  node fileTransfer.js clear-tokens     Wipe the local token cache
+  node fileTransfer.js export      Fetch all images from source store → export.json
+  node fileTransfer.js import      Upload images from export.json → dest store
+  node fileTransfer.js transfer    Do both in one step
 
 Config (.env):
-  FROM_STORE_URL        e.g. my-source.myshopify.com
-  FROM_CLIENT_ID        Client ID from Dev Dashboard (source app)
-  FROM_CLIENT_SECRET    Client Secret from Dev Dashboard (source app)
-
-  TO_STORE_URL          e.g. my-dest.myshopify.com
-  TO_CLIENT_ID          Client ID from Dev Dashboard (dest app)
-  TO_CLIENT_SECRET      Client Secret from Dev Dashboard (dest app)
+  FROM_STORE_URL       Source store domain  e.g. my-source.myshopify.com
+  FROM_ACCESS_TOKEN    Source store token   (use shopify-token-generator)
+  TO_STORE_URL         Dest store domain    e.g. my-dest.myshopify.com
+  TO_ACCESS_TOKEN      Dest store token     (use shopify-token-generator)
 `);
 }
