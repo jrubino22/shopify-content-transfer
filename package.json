@@ -1,0 +1,14 @@
+{
+    "name": "shopify-file-transfer",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+      "transfer": "node fileTransfer.js transfer",
+      "export": "node fileTransfer.js export",
+      "import": "node fileTransfer.js import"
+    },
+    "dependencies": {
+      "dotenv": "^16.4.5",
+      "node-fetch": "^3.3.2"
+    }
+  }
