@@ -2,6 +2,7 @@
  * fileTransfer.js
  *
  * Transfers image files from one Shopify store to another.
+ * Skips images that already exist in the destination store (matched by filename).
  * Requires permanent access tokens in .env (use shopify-token-generator to get them).
  *
  * Usage:
@@ -14,6 +15,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as dotenv from "dotenv";
+import { buildDestImageMap, extractFilename } from "./lib/imageMap.js";
 
 dotenv.config();
 
@@ -70,7 +72,6 @@ async function gql(store, token, query, variables = {}) {
   }
 
   const json = await res.json();
-
   if (json.errors?.length) {
     throw new Error(`GraphQL error: ${JSON.stringify(json.errors, null, 2)}`);
   }
@@ -177,7 +178,7 @@ const FILE_CREATE_MUTATION = `
 `;
 
 async function uploadSingleFile(file) {
-  const filename = file.url.split("/").pop().split("?")[0] || "image.jpg";
+  const filename = extractFilename(file.url);
   const mimeType = file.mimeType ?? "image/jpeg";
 
   // Step 1 — request a staged upload target
@@ -247,17 +248,31 @@ async function runImport(files = null) {
 
   log(`Store:           ${TO_STORE}`);
   log(`Files to import: ${files.length}`);
+
+  // Build destination image map upfront so we can skip existing files
+  divider("Checking existing images in destination store");
+  const destImageMap = await buildDestImageMap(log);
+
   console.log("");
 
   let successCount = 0;
+  let skippedCount = 0;
   let failCount    = 0;
 
   for (let i = 0; i < files.length; i++) {
-    const file  = files[i];
-    const label = file.url.split("/").pop().split("?")[0];
+    const file     = files[i];
+    const filename = extractFilename(file.url);
+
+    // Skip if filename already exists in destination store
+    if (destImageMap[filename]) {
+      process.stdout.write(`  [${i + 1}/${files.length}] ${filename} ... `);
+      console.log("⏭  skipped");
+      skippedCount++;
+      continue;
+    }
 
     try {
-      process.stdout.write(`  [${i + 1}/${files.length}] ${label} ... `);
+      process.stdout.write(`  [${i + 1}/${files.length}] ${filename} ... `);
       await uploadSingleFile(file);
       console.log("✅");
       successCount++;
@@ -270,8 +285,15 @@ async function runImport(files = null) {
     await sleep(500);
   }
 
-  console.log("");
-  ok(`Import complete — ${successCount} succeeded, ${failCount} failed`);
+  console.log(`
+${"─".repeat(55)}
+  SUMMARY
+${"─".repeat(55)}
+  Uploaded: ${successCount}
+  Skipped:  ${skippedCount}
+  Failed:   ${failCount}
+${"─".repeat(55)}
+`);
 }
 
 // ─── Transfer (export + import) ───────────────────────────────────────────────
